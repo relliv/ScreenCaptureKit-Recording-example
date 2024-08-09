@@ -5,6 +5,8 @@
 //
 
 import AVFoundation
+import AVFAudio
+import Cocoa
 import CoreGraphics
 import ScreenCaptureKit
 import VideoToolbox
@@ -29,7 +31,7 @@ do {
     }
 
     let url = URL(filePath: FileManager.default.currentDirectoryPath).appending(path: "recording \(Date()).mov")
-//    let cropRect = CGRect(x: 0, y: 0, width: 960, height: 540)
+    // let cropRect = CGRect(x: 0, y: 0, width: 960, height: 540)
     let screenRecorder = try await ScreenRecorder(url: url, displayID: CGMainDisplayID(), cropRect: nil, mode: .h264_sRGB)
 
     print("Starting screen recording of main display")
@@ -45,17 +47,32 @@ do {
     print("Error during recording:", error)
 }
 
+extension CMSampleBuffer {
+    var asPCMBuffer: AVAudioPCMBuffer? {
+        try? self.withAudioBufferList { audioBufferList, _ -> AVAudioPCMBuffer? in
+            guard let absd = self.formatDescription?.audioStreamBasicDescription else { return nil }
+            guard let format = AVAudioFormat(standardFormatWithSampleRate: absd.mSampleRate, channels: absd.mChannelsPerFrame) else { return nil }
+            return AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: audioBufferList.unsafePointer)
+        }
+    }
+}
 
 
 struct ScreenRecorder {
     private let videoSampleBufferQueue = DispatchQueue(label: "ScreenRecorder.VideoSampleBufferQueue")
+    private let audioSampleBufferQueue = DispatchQueue(label: "ScreenRecorder.AudioSampleBufferQueue")
 
     private let assetWriter: AVAssetWriter
     private let videoInput: AVAssetWriterInput
     private let streamOutput: StreamOutput
     private var stream: SCStream
+    private var audioSettings: [String: Any] = [:]
+    var vwInput, awInput, micInput: AVAssetWriterInput!
 
     init(url: URL, displayID: CGDirectDisplayID, cropRect: CGRect?, mode: RecordMode) async throws {
+        audioSettings = [AVSampleRateKey : 48000, AVNumberOfChannelsKey : 2] // reset audioSettings
+        audioSettings[AVFormatIDKey] = kAudioFormatMPEG4AAC
+        audioSettings[AVEncoderBitRateKey] = 320 * 1000
 
         // Create AVAssetWriter for a QuickTime movie file
         self.assetWriter = try AVAssetWriter(url: url, fileType: .mov)
@@ -101,13 +118,24 @@ struct ScreenRecorder {
 
         // Create AVAssetWriter input for video, based on the output settings from the Assistant
         videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
+        print("audio settings:")
+        print(audioSettings)
+
+        awInput = AVAssetWriterInput(mediaType: AVMediaType.audio, outputSettings: audioSettings)
+        awInput.expectsMediaDataInRealTime = true
         videoInput.expectsMediaDataInRealTime = true
-        streamOutput = StreamOutput(videoInput: videoInput)
+        streamOutput = StreamOutput(videoInput: videoInput, awInput: awInput)
 
         // Adding videoInput to assetWriter
         guard assetWriter.canAdd(videoInput) else {
             throw RecordingError("Can't add input to asset writer")
         }
+
+        if assetWriter.canAdd(awInput) {
+            assetWriter.add(awInput)
+            print("Audio input added to asset writer")
+        }
+
         assetWriter.add(videoInput)
 
         guard assetWriter.startWriting() else {
@@ -152,14 +180,15 @@ struct ScreenRecorder {
         case .hevc_displayP3:
             configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked // 'l10r'
             configuration.colorSpaceName = CGColorSpace.displayP3
-//        case .hevc_displayP3_HDR:
-//            configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked // 'l10r'
-//            configuration.colorSpaceName = CGColorSpace.displayP3
+    //    case .hevc_displayP3_HDR:
+    //        configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked // 'l10r'
+    //        configuration.colorSpaceName = CGColorSpace.displayP3
         }
 
         // Create SCStream and add local StreamOutput object to receive samples
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         try stream.addStreamOutput(streamOutput, type: .screen, sampleHandlerQueue: videoSampleBufferQueue)
+        try stream.addStreamOutput(streamOutput, type: .audio, sampleHandlerQueue: audioSampleBufferQueue)
     }
 
     func start() async throws {
@@ -201,13 +230,17 @@ struct ScreenRecorder {
         var sessionStarted = false
         var firstSampleTime: CMTime = .zero
         var lastSampleBuffer: CMSampleBuffer?
+        var streamType: StreamType?
+        var audioFile: AVAudioFile?
+        var vwInput, awInput, micInput: AVAssetWriterInput!
 
-        init(videoInput: AVAssetWriterInput) {
+        init(videoInput: AVAssetWriterInput, awInput: AVAssetWriterInput) {
             self.videoInput = videoInput
         }
 
         func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-
+            print("didOutputSampleBuffer", type)
+            
             // Return early if session hasn't started yet
             guard sessionStarted else { return }
 
@@ -224,7 +257,6 @@ struct ScreenRecorder {
                   let status = SCFrameStatus(rawValue: statusRawValue),
                   status == .complete
             else { return }
-
 
             switch type {
             case .screen:
@@ -257,7 +289,19 @@ struct ScreenRecorder {
                 }
 
             case .audio:
-                break
+                print("streamType == .systemaudio", streamType == .systemaudio)
+                
+                if streamType == .systemaudio { // write directly to file if not video recording
+                    guard let samples = sampleBuffer.asPCMBuffer else { return }
+                    do {
+                        try audioFile?.write(from: samples)
+                    }
+                    catch { assertionFailure("audio file writing issue") }
+                } else { // otherwise send the audio data to AVAssetWriter
+                    if (awInput != nil) && awInput.isReadyForMoreMediaData {
+                        awInput.append(sampleBuffer)
+                    }
+                }
 
             @unknown default:
                 break
@@ -266,6 +310,9 @@ struct ScreenRecorder {
     }
 }
 
+enum StreamType: Int {
+    case screen, window, systemaudio
+}
 
 // AVAssetWriterInput supports maximum resolution of 4096x2304 for H.264
 private func downsizedVideoSize(source: CGSize, scaleFactor: Int, mode: RecordMode) -> (width: Int, height: Int) {
